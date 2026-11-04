@@ -262,3 +262,60 @@ def test_lifespan_state():
     loop = asyncio.new_event_loop()
     loop.run_until_complete(test())
     loop.close()
+
+
+def test_lifespan_shutdown_unhandled_exception_on_mode(caplog):
+    async def app(scope, receive, send):
+        message = await receive()
+        assert message["type"] == "lifespan.startup"
+        await send({"type": "lifespan.startup.complete"})
+        message = await receive()
+        assert message["type"] == "lifespan.shutdown"
+        raise RuntimeError("Crash on shutdown without sending failed event")
+
+    async def test():
+        config = Config(app=app, lifespan="on")
+        lifespan = LifespanOn(config)
+
+        await lifespan.startup()
+        assert not lifespan.should_exit
+        await lifespan.shutdown()
+        # Invariant: Unhandled error in shutdown with lifespan='on' must set should_exit
+        assert lifespan.error_occurred is True
+        assert lifespan.shutdown_failed is False
+        assert lifespan.should_exit is True
+
+    loop = asyncio.new_event_loop()
+    loop.run_until_complete(test())
+    loop.close()
+
+    error_messages = [
+        record.message for record in caplog.records if record.name == "uvicorn.error" and record.levelname == "ERROR"
+    ]
+    assert any("Application shutdown failed. Exiting." in msg for msg in error_messages)
+
+
+def test_lifespan_auto_mode_logs_unsupported_info(caplog):
+    async def app(scope, receive, send):
+        raise RuntimeError("Lifespan unsupported")
+
+    async def test():
+        config = Config(app=app, lifespan="auto")
+        lifespan = LifespanOn(config)
+
+        await lifespan.startup()
+        assert lifespan.error_occurred is True
+        assert lifespan.should_exit is False
+
+    loop = asyncio.new_event_loop()
+    loop.run_until_complete(test())
+    loop.close()
+
+    info_messages = [
+        record.message for record in caplog.records if record.name == "uvicorn.error" and record.levelname == "INFO"
+    ]
+    error_messages = [
+        record.message for record in caplog.records if record.name == "uvicorn.error" and record.levelname == "ERROR"
+    ]
+    assert any("ASGI 'lifespan' protocol appears unsupported." in msg for msg in info_messages)
+    assert not any("Exception in 'lifespan' protocol" in msg for msg in error_messages)
